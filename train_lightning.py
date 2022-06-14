@@ -12,6 +12,11 @@ from mel_processing import mel_spectrogram_torch, spec_to_mel_torch
 from models_bigvgan import SynthesizerTrn, MultiPeriodDiscriminator
 import commons
 from losses import generator_loss, discriminator_loss, feature_loss
+from data_utils_vocoder import (
+    TextAudioLoader,
+    TextAudioCollate,
+    DistributedBucketSampler
+)
 
 class LitBigVGAN(pl.LightningModule):
     def __init__(self, train, data, model):
@@ -25,7 +30,8 @@ class LitBigVGAN(pl.LightningModule):
         self.discriminator = MultiPeriodDiscriminator(hparams.model.use_spectral_norm)
 
     def training_step(self, batch, batch_idx, optimizer_idx):
-        spec, spec_lengths, y, y_lengths = batch
+        # spec, spec_lengths, y, y_lengths = batch
+        x, x_lengths, spec, spec_lengths, y, y_lengths, sid = batch
         y_hat, ids_slice = self.generator(spec.cuda(), spec_lengths.cuda())
         mel = spec_to_mel_torch(
             spec.float(),
@@ -77,26 +83,52 @@ class LitBigVGAN(pl.LightningModule):
             betas=self.hparams.train.betas,
             eps=self.hparams.train.eps
         )
-        return [optim_d, optim_g], []
+        scheduler_d = torch.optim.lr_scheduler.ExponentialLR(optim_g, gamma=self.hparams.train.lr_decay, last_epoch=-1)
+        scheduler_g = torch.optim.lr_scheduler.ExponentialLR(optim_g, gamma=self.hparams.train.lr_decay, last_epoch=-1)
 
+        return [optim_d, optim_g], [{'scheduler': scheduler_d, 'interval': 'epoch'}, {'scheduler': scheduler_g, 'interval': 'epoch'}]
 
+    def configure_gradient_clipping(self, optimizer, optimizer_idx, gradient_clip_val, gradient_clip_algorithm):
+        if optimizer_idx == 0:
+            commons.clip_grad_value_(self.discriminator.parameters(), None)
+        if optimizer_idx == 1:
+            commons.clip_grad_value_(self.generator.parameters(), None)
 
 if __name__ == '__main__':
-    with open('configs/vctk_bigvgan.json', 'r') as f:
+    with open('configs/vctk.json', 'r') as f:
         data = f.read()
     hparams = HParams(**json.loads(data))
 
     # ds = AudioMNISTDataset('./AudioMNIST/data', hparams)
-    ds = PathsDataset('paths_valid.txt', hparams)
-    loader = DataLoader(ds, batch_size=16, collate_fn=collate_fn)
+
+    # ds = PathsDataset('paths_valid.txt', hparams)
+    # train_loader = DataLoader(ds, batch_size=8, collate_fn=collate_fn)
+
+    train_dataset = TextAudioLoader(hparams.data.training_files, hparams.data, is_train=True)
+    train_sampler = DistributedBucketSampler(
+        train_dataset,
+        hparams.train.batch_size,
+        [32, 300, 400, 500, 600, 700, 800, 900, 1000],
+        num_replicas=1,
+        rank=0,
+        shuffle=True
+    )
+    collate_fn = TextAudioCollate()
+    train_loader = DataLoader(
+        train_dataset,
+        num_workers=8,
+        shuffle=False,
+        pin_memory=True,
+        collate_fn=collate_fn,
+        batch_sampler=train_sampler
+    )
+
     model = LitBigVGAN(hparams.train, hparams.data, hparams.model)
     trainer = pl.Trainer(
         accelerator="gpu",
         devices=1,
-        precision=16,
         log_every_n_steps=10,
-        gradient_clip_val=1000,
-        accumulate_grad_batches=2
+        accumulate_grad_batches=8
     )
 
-    trainer.fit(model, loader)
+    trainer.fit(model, train_loader)
