@@ -1,4 +1,3 @@
-#https://console.cloud.google.com/compute/instancesDetail/zones/us-central1-a/instances/nate-gpu-3?project=huggingface-ml&pageState=(%22duration%22:(%22groupValue%22:%22PT1H%22,%22customValue%22:null))
 from mel_processing import spectrogram_torch
 import torch
 import librosa
